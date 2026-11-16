@@ -1,0 +1,139 @@
+import { auth } from "@/auth";
+import { NextResponse } from "next/server";
+
+// CSP needs a per-request nonce so Next.js's own inline hydration bootstrap
+// scripts (`self.__next_f.push(...)`, present on every App Router page) can
+// run without a blanket 'unsafe-inline' - see
+// https://nextjs.org/docs/app/guides/content-security-policy. A static CSP
+// from next.config.ts's headers() has no per-request nonce, which is what
+// silently blocked those scripts and broke all client-side interactivity
+// site-wide the first time a CSP was added there instead of here.
+function buildCsp(nonce: string) {
+  const isDev = process.env.NODE_ENV === "development";
+  return [
+    "default-src 'self'",
+    // 'strict-dynamic' lets a script our own nonce'd bundle injects (e.g.
+    // Stripe.js's loadStripe() appending <script src="https://js.stripe.com/v3">)
+    // run without listing every such origin - the explicit https://js.stripe.com
+    // stays too as a fallback for browsers that don't support strict-dynamic.
+    `script-src 'self' 'nonce-${nonce}' 'strict-dynamic' https://js.stripe.com${isDev ? " 'unsafe-eval'" : ""}`,
+    // Inline `style={{...}}` attributes have no CSP nonce mechanism (only
+    // <style> elements do), so this has to stay 'unsafe-inline'.
+    "style-src 'self' 'unsafe-inline'",
+    // assets.duffel.com serves the airline logos in offer.owner.logo_symbol_url.
+    "img-src 'self' data: https://assets.duffel.com",
+    "font-src 'self'",
+    // *.sentry.io covers both ingest.sentry.io (US) and ingest.de.sentry.io
+    // (EU) - which region a given DSN posts to depends on which Sentry org
+    // region it was created in, not something this app controls.
+    "connect-src 'self' https://api.stripe.com https://*.sentry.io",
+    "frame-src https://js.stripe.com https://hooks.stripe.com",
+    "object-src 'none'",
+    "base-uri 'self'",
+    "form-action 'self'",
+    "frame-ancestors 'none'",
+  ].join("; ");
+}
+
+// Set only by scripts/run-admin-local.mjs, which launches a `next dev`
+// instance dedicated to browsing /admin locally against a real (typically
+// production) DATABASE_URL. The admin dashboard is deliberately NOT part of
+// the deployed site at all (see the VERCEL check below) - it's a local-only
+// tool, so it doesn't need its own login flow; this instance never leaves
+// your machine.
+const isAdminLocalMode = process.env.ADMIN_LOCAL_MODE === "1";
+
+export default auth((req) => {
+  const isLoggedIn = !!req.auth;
+  const { pathname } = req.nextUrl;
+
+  // The admin dashboard must never be reachable on the deployed site
+  // (production or preview) - VERCEL is set to "1" in every Vercel-built
+  // environment. 404, not a redirect, so its existence isn't revealed.
+  if (pathname.startsWith("/admin") && process.env.VERCEL === "1") {
+    return new NextResponse("Not Found", { status: 404 });
+  }
+
+  if (isAdminLocalMode) {
+    // This instance exists only to serve /admin - block everything else so
+    // a stray click can't read/write production data through the rest of
+    // the app (checkout, profile edits, etc.) via this local server.
+    if (!pathname.startsWith("/admin")) {
+      return new NextResponse("Not Found", { status: 404 });
+    }
+    return NextResponse.next();
+  }
+
+  const isProtected =
+    pathname.startsWith("/bookings") ||
+    pathname.startsWith("/booking/") ||
+    pathname.startsWith("/profile");
+
+  if (isProtected && !isLoggedIn) {
+    const loginUrl = new URL("/login", req.url);
+    loginUrl.searchParams.set("callbackUrl", pathname);
+    return NextResponse.redirect(loginUrl);
+  }
+
+  // Rides the same per-request tokenVersion DB read (verifyTokenVersion in
+  // src/auth.ts), so this isn't an extra query - the isAdmin claim is
+  // already as fresh as tokenVersion itself. Admin API routes/pages still
+  // re-check isAdmin against the DB directly (defense-in-depth against a
+  // demoted admin whose JWT hasn't rotated yet) - this gate is just the
+  // first line of defense, not the only one.
+  if (pathname.startsWith("/admin")) {
+    if (!isLoggedIn) {
+      const loginUrl = new URL("/login", req.url);
+      loginUrl.searchParams.set("callbackUrl", pathname);
+      return NextResponse.redirect(loginUrl);
+    }
+    if (!req.auth?.user?.isAdmin) {
+      // Redirect non-admins to home rather than a distinguishable 404/403 -
+      // don't reveal that an /admin route exists to a logged-in non-admin.
+      return NextResponse.redirect(new URL("/", req.url));
+    }
+  }
+
+  const nonce = Buffer.from(crypto.randomUUID()).toString("base64");
+  const csp = buildCsp(nonce);
+
+  const requestHeaders = new Headers(req.headers);
+  requestHeaders.set("x-nonce", nonce);
+  requestHeaders.set("Content-Security-Policy", csp);
+
+  const response = NextResponse.next({ request: { headers: requestHeaders } });
+  response.headers.set("Content-Security-Policy", csp);
+
+  // First-touch channel attribution (Channel Coverage agent's mandate: know
+  // which acquisition channel is actually driving traffic). Only set on
+  // first visit - a later utm_source-less page view shouldn't overwrite the
+  // channel that originally brought this visitor in. Non-essential (purely
+  // marketing attribution, no functional purpose), so it's gated on explicit
+  // cookie consent (see CookieConsentBanner) rather than set unconditionally -
+  // a visitor who hasn't consented yet, or who declined, gets none of this
+  // even though it costs some attribution accuracy for very-first-request
+  // conversions before a consent decision exists.
+  const utmSource = req.nextUrl.searchParams.get("utm_source");
+  const hasConsent = req.cookies.get("orbi_cookie_consent")?.value === "accepted";
+  if (utmSource && hasConsent && !req.cookies.get("orbi_channel")) {
+    response.cookies.set("orbi_channel", utmSource, {
+      maxAge: 60 * 60 * 24 * 30,
+      sameSite: "lax",
+    });
+  }
+
+  return response;
+});
+
+export const config = {
+  // Broad on purpose - CSP needs to apply to every HTML-rendering route, not
+  // just the auth-protected ones the redirect logic above cares about. API
+  // routes are excluded: they return JSON (no inline scripts to nonce, no
+  // CSP to enforce) and already run their own `auth()` check in-handler, so
+  // routing them through this wrapper too would just be wasted session-cookie
+  // decoding on every request - including unauthenticated ones like the
+  // Stripe webhook and the cron endpoint, where it's also pure risk for no
+  // benefit (an exception in auth() would fire before those routes ever get
+  // to their own signature/token checks).
+  matcher: ["/((?!api/|_next/static|_next/image|favicon.ico).*)"],
+};

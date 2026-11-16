@@ -1,0 +1,348 @@
+import { NextRequest, NextResponse } from "next/server";
+import * as Sentry from "@sentry/nextjs";
+import { Prisma } from "@prisma/client";
+import { auth } from "@/auth";
+import { db } from "@/lib/db";
+import { duffelRequest, DuffelError } from "@/lib/duffel/client";
+import { getOfferWithServices } from "@/lib/duffel/search";
+import type { SearchParams } from "@/lib/parser/types";
+import { getStripe } from "@/lib/stripe";
+import { checkRateLimit } from "@/lib/rate-limit";
+import { passengerValidationError } from "@/lib/passengerValidation";
+import { sendBookingConfirmations } from "@/lib/notifications";
+import { track } from "@vercel/analytics/server";
+import { SERVICE_FEE_CENTS, chargeAmountCents, centsToAmountString } from "@/lib/pricing";
+
+// Duffel order creation + Stripe payment intent handling can each take a
+// few seconds; give this route enough headroom to not get cut off mid-request.
+export const maxDuration = 30;
+
+function isUniqueConstraintError(err: unknown): boolean {
+  return err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002";
+}
+
+export interface BookingPassenger {
+  id: string;
+  given_name: string;
+  family_name: string;
+  born_on: string;
+  gender: "m" | "f";
+  title: "mr" | "ms" | "mrs" | "dr" | "miss";
+  email: string;
+  phone_number: string;
+  // Required for Duffel/the airline to accept an international order -
+  // ISO 3166-1 alpha-2 country codes (e.g. "GB").
+  nationality: string;
+  passport_number: string;
+  passport_expiry: string;
+}
+
+interface CreateBookingBody {
+  offerId: string;
+  searchParams: SearchParams;
+  passengers: BookingPassenger[];
+  stripePaymentIntentId: string;
+  specialRequests?: string;
+}
+
+export async function POST(req: NextRequest) {
+  const session = await auth();
+  if (!session?.user?.id) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  if (process.env.NODE_ENV !== "test") {
+    const rl = await checkRateLimit(`booking:${session.user.id}`, { max: 5, windowMs: 60_000 });
+    if (!rl.ok) {
+      return NextResponse.json(
+        { error: "Too many booking attempts. Please wait before trying again." },
+        { status: 429, headers: { "Retry-After": String(rl.retryAfter ?? 60) } }
+      );
+    }
+  }
+
+  const body = (await req.json()) as CreateBookingBody;
+  const { offerId, searchParams, passengers, stripePaymentIntentId, specialRequests } = body;
+
+  // Fail fast on malformed/incomplete passenger data before claiming a
+  // booking row or touching Stripe/Duffel - passport/nationality are not
+  // optional, the order will be rejected without them.
+  const todayStr = new Date().toISOString().slice(0, 10);
+  for (const p of passengers) {
+    const err = passengerValidationError(p, todayStr);
+    if (err) return NextResponse.json({ error: err }, { status: 400 });
+  }
+
+  // Verify payment succeeded before touching Duffel (CLAUDE.md guardrail #2)
+  const pi = await getStripe().paymentIntents.retrieve(stripePaymentIntentId);
+  if (pi.status !== "succeeded") {
+    return NextResponse.json(
+      { error: "Payment has not been confirmed." },
+      { status: 400 }
+    );
+  }
+
+  if (pi.metadata.userId !== session.user.id) {
+    return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+  }
+
+  if (pi.metadata.offerId !== offerId) {
+    return NextResponse.json(
+      { error: "Payment intent does not match the selected offer." },
+      { status: 400 }
+    );
+  }
+
+  const passengerNames = passengers.map((p) => `${p.given_name} ${p.family_name}`);
+
+  // Claim this PaymentIntent with a "pending" row BEFORE doing anything
+  // expensive (verifying the offer, calling Duffel). stripePaymentIntentId
+  // is DB-unique, so if two requests for the same succeeded payment race
+  // each other, only one create() below can win - the loser gets a unique-
+  // constraint error here and never reaches the Duffel order call at all.
+  // Verifying-then-writing-once (the previous approach) only stopped a
+  // second *row*, not a second real Duffel order, since both requests would
+  // already be past the point of calling Duffel by the time either wrote to
+  // the database.
+  let booking;
+  try {
+    booking = await db.booking.create({
+      data: {
+        userId: session.user.id,
+        duffelOrderId: null,
+        duffelBookingRef: null,
+        status: "pending",
+        totalAmount: (pi.amount / 100).toFixed(2),
+        totalCurrency: pi.currency.toUpperCase(),
+        serviceFeeAmount: centsToAmountString(SERVICE_FEE_CENTS),
+        offerSnapshot: { offerId } as Prisma.InputJsonValue,
+        searchParams: searchParams as unknown as Prisma.InputJsonValue,
+        passengerNames,
+        stripePaymentIntentId,
+        ...(specialRequests ? { specialRequests } : {}),
+      },
+    });
+  } catch (err) {
+    if (!isUniqueConstraintError(err)) throw err;
+    const existingBooking = await db.booking.findFirst({
+      where: { stripePaymentIntentId, userId: session.user.id },
+    });
+    // Only a genuinely completed booking is safe to report as success on
+    // retry - a prior "failed"/"pending" row (offer gone, amount mismatch,
+    // concurrent request still in flight) must keep surfacing as an error,
+    // or a client retrying after a transient failure clears would be told
+    // it succeeded when no order was ever placed.
+    if (existingBooking?.status === "confirmed") {
+      return NextResponse.json({ booking: existingBooking }, { status: 200 });
+    }
+    return NextResponse.json(
+      {
+        error: "This payment did not result in a completed booking. Contact support.",
+        booking: existingBooking,
+      },
+      { status: 409 }
+    );
+  }
+
+  // Re-fetch the offer from Duffel rather than trusting a client-supplied
+  // one, and confirm the amount actually charged matches its real price -
+  // otherwise a client could pay $0.01 via a tampered payment-intent request
+  // while still supplying a genuine, expensive offerId here (CLAUDE.md
+  // guardrail #2: no money-moving step without a real, unspoofable check).
+  let offer;
+  try {
+    offer = await getOfferWithServices(offerId);
+  } catch (err) {
+    // Stripe has already charged the card at this point - even though the
+    // booking can't proceed, the claimed row above must be updated to
+    // reflect that (not left "pending" forever) so support can find and
+    // refund a charged-but-unbooked customer.
+    const failedBooking = await db.booking.update({
+      where: { id: booking.id },
+      data: {
+        status: "failed",
+        offerSnapshot: {
+          offerId,
+          reason: err instanceof DuffelError ? "offer_unavailable" : "offer_verification_failed",
+        },
+      },
+    });
+    if (err instanceof DuffelError) {
+      return NextResponse.json(
+        { error: "That offer is no longer available.", booking: failedBooking },
+        { status: 410 }
+      );
+    }
+    return NextResponse.json(
+      { error: "Could not verify the offer.", booking: failedBooking },
+      { status: 502 }
+    );
+  }
+
+  const expectedCents = chargeAmountCents(offer.total_amount);
+  if (
+    pi.amount !== expectedCents ||
+    pi.currency !== offer.total_currency.toLowerCase()
+  ) {
+    const failedBooking = await db.booking.update({
+      where: { id: booking.id },
+      data: {
+        status: "failed",
+        totalAmount: centsToAmountString(expectedCents),
+        totalCurrency: offer.total_currency,
+        offerSnapshot: offer as unknown as Prisma.InputJsonValue,
+      },
+    });
+    return NextResponse.json(
+      { error: "The amount charged does not match this offer's price.", booking: failedBooking },
+      { status: 400 }
+    );
+  }
+
+  // The card is already charged by this point (see guardrail-2 note above).
+  // An offer that has expired between confirm-page load and this request
+  // would be rejected by Duffel's order-creation endpoint anyway - catching
+  // it here turns a doomed, generic Duffel error into a labeled, diagnosable
+  // failure instead.
+  if (new Date(offer.expires_at).getTime() <= Date.now()) {
+    const failedBooking = await db.booking.update({
+      where: { id: booking.id },
+      data: {
+        status: "failed",
+        totalAmount: centsToAmountString(expectedCents),
+        totalCurrency: offer.total_currency,
+        offerSnapshot: {
+          ...(offer as unknown as Record<string, unknown>),
+          failureReason: { reason: "offer_expired", expires_at: offer.expires_at },
+        } as unknown as Prisma.InputJsonValue,
+      },
+    });
+    Sentry.captureException(
+      new Error("Offer expired before Duffel order creation"),
+      {
+        tags: { route: "api/booking", failureMode: "offer_expired" },
+        extra: { bookingId: booking.id, offerId, stripePaymentIntentId, expires_at: offer.expires_at },
+      }
+    );
+    return NextResponse.json(
+      {
+        error:
+          "This price expired before we could confirm your booking. You have NOT been booked; the charge will be refunded. Reference: " +
+          booking.id,
+        booking: failedBooking,
+      },
+      { status: 410 }
+    );
+  }
+
+  let duffelOrderId: string | null = null;
+  let duffelBookingRef: string | null = null;
+  let status = "failed";
+  let failureReason: Prisma.InputJsonValue | null = null;
+
+  try {
+    const order = await duffelRequest<{
+      id: string;
+      booking_reference: string;
+    }>("/air/orders", {
+      method: "POST",
+      body: {
+        data: {
+          type: "instant",
+          selected_offers: [offerId],
+          passengers: passengers.map((p) => ({
+            id: p.id,
+            given_name: p.given_name,
+            family_name: p.family_name,
+            born_on: p.born_on,
+            gender: p.gender,
+            title: p.title,
+            email: p.email,
+            phone_number: p.phone_number,
+            identity_documents: [
+              {
+                type: "passport",
+                // Trimmed defensively here (not just validated) so a
+                // whitespace-padded value - possible from a client bug, or
+                // any direct API caller bypassing the UI - never reaches
+                // the airline's passport-matching system.
+                unique_identifier: p.passport_number.trim(),
+                expires_on: p.passport_expiry,
+                issuing_country_code: p.nationality,
+              },
+            ],
+          })),
+          payments: [
+            {
+              type: "balance",
+              amount: offer.total_amount,
+              currency: offer.total_currency,
+            },
+          ],
+        },
+      },
+    });
+    duffelOrderId = order.id;
+    duffelBookingRef = order.booking_reference;
+    status = "confirmed";
+  } catch (err) {
+    console.error("Duffel order creation failed:", err);
+    const detail =
+      err instanceof DuffelError
+        ? { reason: "duffel_order_failed", status: err.status, errors: err.response.errors }
+        : { reason: "duffel_order_failed", message: err instanceof Error ? err.message : String(err) };
+    failureReason = detail as Prisma.InputJsonValue;
+    Sentry.captureException(err, {
+      tags: { route: "api/booking", failureMode: "duffel_order_creation" },
+      extra: {
+        bookingId: booking.id,
+        offerId,
+        stripePaymentIntentId,
+        duffelStatus: err instanceof DuffelError ? err.status : undefined,
+      },
+    });
+  }
+
+  const finalBooking = await db.booking.update({
+    where: { id: booking.id },
+    data: {
+      duffelOrderId,
+      duffelBookingRef,
+      status,
+      totalAmount: centsToAmountString(expectedCents),
+      totalCurrency: offer.total_currency,
+      offerSnapshot: (failureReason
+        ? { ...(offer as unknown as Record<string, unknown>), failureReason }
+        : (offer as unknown as Record<string, unknown>)) as unknown as Prisma.InputJsonValue,
+    },
+    include: {
+      user: {
+        select: { email: true, passengerProfile: { select: { phone: true } } },
+      },
+    },
+  });
+
+  // This is the only place a booking is ever definitively confirmed (after
+  // a real Duffel order succeeds), so it's the only place that should send
+  // the confirmation - the Stripe webhook used to do this independently
+  // based on payment success alone, which raced against this request (the
+  // webhook usually arrives before this fetch call even completes) and
+  // could flip status to "confirmed" before a Duffel order existed. Firing
+  // from here is also naturally idempotent: a retried request for the same
+  // payment short-circuits through the unique-constraint branch above and
+  // never reaches this line, so it can't double-send.
+  if (status === "confirmed") {
+    sendBookingConfirmations(finalBooking).catch((err) =>
+      console.error("Failed to send booking confirmations:", err)
+    );
+  }
+
+  track("booking_completed", {
+    status,
+    channel: req.cookies.get("orbi_channel")?.value ?? "direct",
+    totalCurrency: offer.total_currency,
+    totalAmount: offer.total_amount,
+  }).catch(() => {});
+
+  return NextResponse.json({ booking: finalBooking }, { status: 201 });
+}

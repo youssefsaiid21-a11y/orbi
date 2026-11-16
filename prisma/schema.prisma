@@ -1,0 +1,194 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id               String           @id @default(cuid())
+  email            String           @unique
+  name             String?
+  passwordHash     String
+  // Bumped on password change. Compared against the value baked into a JWT
+  // at sign-in (see src/auth.ts's jwt callback) - a mismatch means the
+  // session predates the password change and must be treated as revoked,
+  // even though the JWT itself is still cryptographically valid until it
+  // expires. This is the one DB read per session-check the app's otherwise
+  // zero-DB-hit JWT strategy accepts, specifically to close that gap.
+  tokenVersion     Int              @default(0)
+  createdAt        DateTime         @default(now())
+  // TOTP secret (base32) - set as soon as setup begins, but totpEnabled
+  // stays false until the user proves they can actually generate a valid
+  // code with it (src/app/api/auth/mfa/confirm), so a botched enrollment
+  // can never lock someone out.
+  totpSecret       String?
+  totpEnabled      Boolean          @default(false)
+  // The TOTP time-step last accepted for this user (see src/lib/totp.ts's
+  // verifyTotp - each 30s step is a distinct counter value). Without this,
+  // the same valid 6-digit code could be replayed repeatedly for its whole
+  // ~90s validity window (the ±1-step clock-drift tolerance) - checked and
+  // updated in src/lib/authorizeCredentials.ts on every login attempt.
+  totpLastUsedStep Int?
+  // Array of bcrypt-hashed single-use recovery codes, shown to the user
+  // once at enrollment time and never retrievable again. A code is removed
+  // from this array the moment it's used (src/auth.ts's authorize()).
+  backupCodes      Json?
+  // Minimal admin/operator flag (src/app/admin/*, src/app/api/admin/*).
+  // Not exposed via any API - flipped directly in the DB by the founder.
+  isAdmin          Boolean          @default(false)
+  bookings         Booking[]
+  passengerProfile PassengerProfile?
+  trackedSearches  TrackedSearch[]
+  recoveryTokens   AccountRecoveryToken[]
+}
+
+// One-time password/MFA-recovery tokens (src/app/api/auth/recovery/*).
+// tokenHash is HMAC-SHA256(raw, NEXTAUTH_SECRET) - never stored in
+// plaintext. Deliberately not bcrypt: redemption needs an indexed
+// exact-match lookup by the presented token, which bcrypt's per-call
+// salting makes impossible without already knowing the user.
+// ON DELETE CASCADE is a deliberate, narrow deviation from Booking's
+// no-cascade convention - this is ephemeral security data with no
+// legal-retention need, unlike bookings.
+model AccountRecoveryToken {
+  id        String    @id @default(cuid())
+  userId    String
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model PassengerProfile {
+  id              String   @id @default(cuid())
+  userId          String   @unique
+  givenName       String
+  familyName      String
+  bornOn          String
+  gender          String
+  title           String
+  phone           String
+  specialRequests String?
+  // Nullable: required to actually book a flight (Duffel/the airline
+  // rejects international orders without them), but profiles saved before
+  // this field existed won't have it yet - the booking flow treats a
+  // profile missing any of these as incomplete and falls back to the form
+  // instead of quick-book.
+  nationality     String?
+  passportNumber  String?
+  passportExpiry  String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  user            User     @relation(fields: [userId], references: [id])
+}
+
+model ChatSession {
+  id          String   @id
+  sessionData String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([updatedAt])
+}
+
+model Booking {
+  id                    String   @id @default(cuid())
+  userId                String
+  duffelOrderId         String?
+  duffelBookingRef      String?
+  status                String   @default("pending")
+  totalAmount           String
+  totalCurrency         String
+  // Flat per-booking service fee (see src/lib/pricing.ts), included in
+  // totalAmount - broken out separately so margin can actually be
+  // reconciled against Duffel's cost. Existing rows predate the fee model
+  // (charged $0 margin), hence the "0.00" default/backfill.
+  serviceFeeAmount      String   @default("0.00")
+  offerSnapshot         Json
+  searchParams          Json
+  passengerNames        Json
+  stripePaymentIntentId String?
+  specialRequests       String?
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+  user                  User     @relation(fields: [userId], references: [id])
+
+  @@index([userId, createdAt])
+  // Unique, not just indexed: the idempotency check in POST /api/booking is
+  // check-then-act (findFirst, then create) and not itself atomic, so this
+  // is what actually stops two concurrent requests for the same successful
+  // payment from both slipping past that check and creating two Duffel
+  // orders from a single charge.
+  @@unique([stripePaymentIntentId])
+}
+
+// A saved search a user wants to be notified about if the price drops.
+// Checked periodically by POST /api/cron/check-price-drops (see that route
+// for how a real deployment would schedule the calls).
+model TrackedSearch {
+  id                String   @id @default(cuid())
+  userId            String
+  origin            String
+  destination       String
+  departureDate     String
+  returnDate        String?
+  // SearchParams["passengers"], e.g. [{"type":"adult","count":1}]
+  passengers        Json
+  cabinClass        String?
+  // Preference filters from the original search - carried over so the price
+  // re-check compares against the same filtered results the user actually
+  // saw (a "refundable nonstop" search must stay refundable/nonstop when
+  // re-priced, not silently drop those constraints and alert on an unrelated
+  // cheaper fare the user never asked for).
+  preferRefundable  Boolean  @default(false)
+  preferChangeable  Boolean  @default(false)
+  departAfter       String?
+  departBefore      String?
+  maxConnections    Int?
+  lastKnownPrice    String
+  lastKnownCurrency String
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+  user              User     @relation(fields: [userId], references: [id])
+
+  @@index([userId, createdAt])
+  @@index([departureDate])
+}
+
+// Support intake, built for the Customer Support agent (see
+// .claude/agents/customer-support-agent.md and CLAUDE.md's Executive
+// Charter). No relation to User is required - support requests can arrive
+// before signup or from a guest browsing session, so email is captured
+// directly on the ticket rather than requiring a logged-in userId.
+model SupportTicket {
+  id         String   @id @default(cuid())
+  email      String
+  subject    String
+  message    String
+  // Booking reference, if the request is about an existing booking - not a
+  // foreign key, since a ticket should still be storable even if the
+  // reference is mistyped or belongs to a since-deleted row.
+  bookingRef String?
+  status     String   @default("open")
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([status, createdAt])
+}
+
+// Pre-launch, low-commitment interest capture - organic/GEO/content readers
+// who aren't ready for a full account signup yet. `channel` records the
+// first-touch attribution cookie (src/lib/channel.ts) so we know which
+// launch-day channel actually drove signups once real traffic exists.
+model WaitlistSignup {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  channel   String   @default("direct")
+  createdAt DateTime @default(now())
+}

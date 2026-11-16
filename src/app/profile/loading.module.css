@@ -1,0 +1,91 @@
+.page {
+  flex: 1;
+  padding: 2rem 1rem 3rem;
+}
+
+.container {
+  max-width: 580px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.card {
+  background: var(--surface-raised);
+  border: 1px solid var(--border-glass);
+  border-radius: var(--r-lg);
+  padding: 1.25rem 1.5rem;
+  backdrop-filter: blur(16px) saturate(140%);
+}
+
+.row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.45rem 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.row:last-child {
+  border-bottom: none;
+}
+
+.profileGrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.875rem 1.5rem;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.skeletonHeading,
+.skeletonTitle,
+.skeletonLabel,
+.skeletonValue,
+.skeletonFieldLabel,
+.skeletonFieldValue {
+  border-radius: var(--r-md);
+}
+
+.skeletonHeading {
+  composes: skeleton-shimmer from global;
+  width: 100px;
+  height: 28px;
+  margin-bottom: 0.5rem;
+}
+
+.skeletonTitle {
+  composes: skeleton-shimmer from global;
+  width: 80px;
+  height: 10px;
+  margin-bottom: 0.875rem;
+}
+
+.skeletonLabel {
+  composes: skeleton-shimmer from global;
+  width: 60px;
+  height: 14px;
+}
+
+.skeletonValue {
+  composes: skeleton-shimmer from global;
+  width: 140px;
+  height: 14px;
+}
+
+.skeletonFieldLabel {
+  composes: skeleton-shimmer from global;
+  width: 50px;
+  height: 8px;
+}
+
+.skeletonFieldValue {
+  composes: skeleton-shimmer from global;
+  width: 100px;
+  height: 16px;
+}
